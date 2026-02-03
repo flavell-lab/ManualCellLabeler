@@ -11,6 +11,7 @@ st.set_page_config(layout="wide", page_title="ManualCellLabeler")
 
 # Constants
 FLV_UTILS_DATA_DIR = "/store1/shared/flv_utils_data/"
+MULTI_PROJECT_CSV = "/store1/shared/flv_utils_data/flagging/flagged_rois/all_projects_flagged_sorted.csv"
 ARROW_STYLE = dict(facecolor='white', edgecolor='black', width=4, headwidth=12, shrink=0.05)
 GAP, LENGTH = 2, 8
 TAIL_DIST = GAP + LENGTH
@@ -59,10 +60,82 @@ def aggregate_matches(query, selected_configs):
         path_csv = os.path.join(FLV_UTILS_DATA_DIR, prj, f"labels_csv/{uid}.csv")
         df = pd.read_csv(path_csv)
         subset = df[df['Neuron Class'].str.startswith(query, na=False)].copy()
+        subset = subset[pd.to_numeric(subset['ROI ID'], errors='coerce').notna()]
+        subset['ROI ID'] = subset['ROI ID'].astype(int)
         subset['prj_name'] = prj
         subset['data_uid'] = uid
         all_matches.append(subset)
     return pd.concat(all_matches).reset_index(drop=True) if all_matches else pd.DataFrame()
+
+def get_already_labeled_rois(dest_path, query, annotator):
+    """Get list of ROIs already labeled today"""
+    from datetime import datetime
+    today = datetime.now().strftime('%Y-%m-%d')
+    log_file = os.path.join(dest_path, f"{query}_{annotator}_log.csv")
+
+    if not os.path.exists(log_file):
+        return set()
+
+    log_df = pd.read_csv(log_file)
+    # Filter for entries from today
+    if 'Timestamp' in log_df.columns:
+        log_df['Date'] = pd.to_datetime(log_df['Timestamp']).dt.strftime('%Y-%m-%d')
+        today_entries = log_df[log_df['Date'] == today]
+    else:
+        today_entries = log_df
+
+    # Create a set of (Project, UID, ROI_ID) tuples for already-labeled ROIs
+    already_labeled = set()
+    for _, row in today_entries.iterrows():
+        already_labeled.add((row['Project'], row['UID'], int(row['ROI_ID'])))
+
+    return already_labeled
+
+@st.cache_data
+def load_from_multi_project_csv(query, csv_path=None):
+    """Load ROIs from multi-project CSV, filtered by predicted_label (neuron class)"""
+    if csv_path is None:
+        csv_path = MULTI_PROJECT_CSV
+    df = pd.read_csv(csv_path)
+
+    # Filter by predicted_label matching query
+    filtered = df[df['predicted_label'].str.startswith(query, na=False)].copy()
+
+    if filtered.empty:
+        return pd.DataFrame()
+
+    # Validate that projects/UIDs exist in filesystem
+    valid_rows = []
+    for idx, row in filtered.iterrows():
+        prj = row['project']
+        uid = row['target_id']
+        roi_id = row['roi_id']
+
+        prj_root = os.path.join(FLV_UTILS_DATA_DIR, prj)
+        paths = [
+            os.path.join(prj_root, f"autolabel_data/{uid}-NeuroPAL.h5"),
+            os.path.join(prj_root, f"neuron_rois/{uid}-roi.h5"),
+            os.path.join(prj_root, f"processed_h5/{uid}-data.h5"),
+            os.path.join(prj_root, f"labels_csv/{uid}.csv")
+        ]
+
+        if all(os.path.exists(p) for p in paths):
+            # Load the corresponding CSV to get full neuron info
+            csv_path = os.path.join(prj_root, f"labels_csv/{uid}.csv")
+            csv_df = pd.read_csv(csv_path)
+            roi_row = csv_df[csv_df['ROI ID'] == roi_id]
+
+            if not roi_row.empty:
+                roi_info = roi_row.iloc[0].to_dict()
+                roi_info['prj_name'] = prj
+                roi_info['data_uid'] = uid
+                # Add CSV metadata
+                roi_info['csv_predicted_label'] = row['predicted_label']
+                roi_info['csv_tier'] = row['tier']
+                roi_info['csv_flags'] = row['flags']
+                valid_rows.append(roi_info)
+
+    return pd.DataFrame(valid_rows) if valid_rows else pd.DataFrame()
 
 def load_roi_data(prj, uid):
     prj_root = os.path.join(FLV_UTILS_DATA_DIR, prj)
@@ -99,30 +172,102 @@ def save_current_entry(entry_data, path, q, user):
 # --- 3. PHASE 1: SETUP ---
 if not st.session_state.setup_complete:
     st.title("🧫 ManualCellLabeler Setup")
-    
+
+    # Mode selection
+    mode = st.radio(
+        "Data Source Mode",
+        options=["Manual Project Selection", "Load from Multi-Project CSV"],
+        help="Choose how to select ROIs for annotation"
+    )
+
+    st.divider()
+
     c1, c2 = st.columns(2)
     with c1:
         annotator = st.text_input("Enter flv-c username", value="candy")
-        query = st.text_input("Neuron Class Query", value="NSM")
+        query = st.text_input("Neuron Class Query", value="NSM", help="Filter by neuron class (predicted_label in CSV mode)")
     with c2:
-        dest_path = st.text_input("CSV Destination Path", value=f"/store1/{annotator}/")
-        
-    all_projects = [d for d in os.listdir(FLV_UTILS_DATA_DIR) if os.path.isdir(os.path.join(FLV_UTILS_DATA_DIR, d))]
-    selected_projects = st.multiselect("Select Projects", options=all_projects)
-    
-    if selected_projects:
-        final_configs = []
-        for prj in selected_projects:
-            valid_uids = get_valid_uids(prj)
-            if valid_uids:
-                chosen_uids = st.multiselect(f"UIDs for {prj}", options=valid_uids, default=valid_uids)
-                for uid in chosen_uids: final_configs.append((prj, uid))
-        
+        dest_path = st.text_input("⭐ Output Directory (Required)", value=f"/store1/{annotator}/", placeholder="Enter output directory path")
+
+    if not dest_path or not annotator:
+        st.warning("⚠️ Please provide both username and output directory before proceeding.")
+        st.stop()
+
+    matches = None
+    can_launch = False
+
+    if mode == "Manual Project Selection":
+        all_projects = sorted([d for d in os.listdir(FLV_UTILS_DATA_DIR) if os.path.isdir(os.path.join(FLV_UTILS_DATA_DIR, d)) and d.startswith("prj_")])
+        selected_projects = st.multiselect("Select Projects", options=all_projects)
+
+        if selected_projects:
+            final_configs = []
+            for prj in selected_projects:
+                valid_uids = get_valid_uids(prj)
+                if valid_uids:
+                    chosen_uids = st.multiselect(f"UIDs for {prj}", options=valid_uids, default=valid_uids)
+                    for uid in chosen_uids: final_configs.append((prj, uid))
+
+            if final_configs:
+                can_launch = True
+                if st.button("🚀 LAUNCH", type="primary", use_container_width=True):
+                    matches = aggregate_matches(query, final_configs)
+                    if not matches.empty:
+                        # Filter out already-labeled ROIs from today
+                        already_labeled = get_already_labeled_rois(dest_path, query, annotator)
+                        if already_labeled:
+                            original_count = len(matches)
+                            # Filter matches
+                            matches = matches[~matches.apply(
+                                lambda row: (row['prj_name'], row['data_uid'], int(row['ROI ID'])) in already_labeled,
+                                axis=1
+                            )].reset_index(drop=True)
+                            skipped_count = original_count - len(matches)
+                            if skipped_count > 0:
+                                st.info(f"📋 Resuming from progress: Skipped {skipped_count} already-labeled ROIs from today")
+
+                        if not matches.empty:
+                            st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "setup_complete": True, "current_index": 0})
+                            st.rerun()
+                        else:
+                            st.success("🎉 All ROIs for this query have been labeled today!")
+                    else:
+                        st.error(f"No matches found for query '{query}' in selected projects.")
+
+    else:  # Load from Multi-Project CSV
+        csv_path = st.text_input(
+            "Multi-Project CSV Path",
+            value=MULTI_PROJECT_CSV,
+            help="Path to the flagged ROIs CSV file"
+        )
+        st.caption("ROIs will be processed in the order specified in the CSV file.")
+
         if st.button("🚀 LAUNCH", type="primary", use_container_width=True):
-            matches = aggregate_matches(query, final_configs)
+            with st.spinner("Loading ROIs from multi-project CSV..."):
+                matches = load_from_multi_project_csv(query, csv_path)
+
             if not matches.empty:
-                st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "setup_complete": True, "current_index": 0})
-                st.rerun()
+                # Filter out already-labeled ROIs from today
+                already_labeled = get_already_labeled_rois(dest_path, query, annotator)
+                if already_labeled:
+                    original_count = len(matches)
+                    # Filter matches
+                    matches = matches[~matches.apply(
+                        lambda row: (row['prj_name'], row['data_uid'], int(row['ROI ID'])) in already_labeled,
+                        axis=1
+                    )].reset_index(drop=True)
+                    skipped_count = original_count - len(matches)
+                    if skipped_count > 0:
+                        st.info(f"📋 Resuming from progress: Skipped {skipped_count} already-labeled ROIs from today")
+
+                if not matches.empty:
+                    st.success(f"✅ Loaded {len(matches)} ROIs matching '{query}'")
+                    st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "setup_complete": True, "current_index": 0})
+                    st.rerun()
+                else:
+                    st.success("🎉 All ROIs for this query have been labeled today!")
+            else:
+                st.error(f"No valid ROIs found for query '{query}' in multi-project CSV.")
 
 # --- 4. PHASE 2: ANNOTATION ---
 else:
@@ -134,10 +279,21 @@ else:
         roi_id, curr_prj, curr_uid = int(row['ROI ID']), row['prj_name'], row['data_uid']
         
         # Decision logic based on confidence
-        conf_val = int(row['Confidence']) if pd.notna(row['Confidence']) else 3
+        original_conf = int(row['Confidence']) if pd.notna(row['Confidence']) else 3
+        original_conf = max(1, min(5, original_conf))  # Ensure in valid range 1-5
+
+        # Determine default confidence based on label agreement with query
+        original_label = row['Neuron Class'] if pd.notna(row['Neuron Class']) else ""
+        if original_conf >= 4 and original_label.startswith(query):
+            # High confidence label agrees with query - use original confidence (min 3)
+            conf_val = max(3, original_conf)
+        else:
+            # Low confidence or label doesn't match query - default to 2
+            conf_val = 2
+
         if 'last_idx' not in st.session_state or st.session_state.last_idx != st.session_state.current_index:
-            if conf_val >= 4: st.session_state.decision = "Yes"
-            elif conf_val == 3: st.session_state.decision = "Not Sure"
+            if original_conf >= 4: st.session_state.decision = "Yes"
+            elif original_conf == 3: st.session_state.decision = "Not Sure"
             else: st.session_state.decision = "No"
             st.session_state.last_idx = st.session_state.current_index
 
@@ -168,8 +324,13 @@ else:
                         axes[i].set_xticks([]); axes[i].set_yticks([]); axes[i].set_facecolor((0,0,0,0))
                     
                     trace_idx = roi_match[roi_id-1]
-                    axes[3].plot(traces_array[..., trace_idx-1], color='lime', linewidth=1.5)
-                    for idx in np.where(reversal_vec == 1)[0]: axes[3].axvspan(idx, idx+1, color='pink', alpha=0.3)
+                    num_traces = traces_array.shape[-1]
+                    if 0 < trace_idx <= num_traces:
+                        axes[3].plot(traces_array[..., trace_idx-1], color='lime', linewidth=1.5)
+                        for idx in np.where(reversal_vec == 1)[0]: axes[3].axvspan(idx, idx+1, color='pink', alpha=0.3)
+                    else:
+                        axes[3].text(0.5, 0.5, f"Trace unavailable (index {trace_idx}, max {num_traces})",
+                                     transform=axes[3].transAxes, ha='center', va='center', color='orange', fontsize=12)
                     axes[3].set_ylabel(labels[3], fontsize=12, fontweight='bold', color='white', rotation=0, labelpad=45, va='center')
                     axes[3].tick_params(colors='white'); axes[3].set_facecolor((0,0,0,0))
                     st.pyplot(fig, use_container_width=True, clear_figure=True)
@@ -181,12 +342,16 @@ else:
                 if selection: st.session_state.decision = selection
 
                 st.divider()
+                st.markdown("<span class='input-label'>Confirmed Neuron ID</span>", unsafe_allow_html=True)
+                # Use original label if confidence >= 4, otherwise use query
+                if original_conf >= 4 and pd.notna(row['Neuron Class']):
+                    default_label = row['Neuron Class']
+                else:
+                    default_label = query
+                final_label = st.text_input("L", value=default_label if st.session_state.decision != "No" else "", key=f"l_{roi_id}_{curr_uid}", label_visibility="collapsed")
+
                 st.markdown("<span class='input-label'>Confidence Level</span>", unsafe_allow_html=True)
                 confidence = st.select_slider("C", options=["1", "2", "3", "4", "5"], value=str(conf_val), key=f"c_{roi_id}_{curr_uid}", label_visibility="collapsed")
-
-                st.markdown("<span class='input-label'>Confirmed Neuron ID</span>", unsafe_allow_html=True)
-                default_label = row['Neuron Class'] if pd.notna(row['Neuron Class']) else query
-                final_label = st.text_input("L", value=default_label if st.session_state.decision != "No" else "", key=f"l_{roi_id}_{curr_uid}", label_visibility="collapsed")
 
                 st.markdown("<span class='input-label'>Alternative ID</span>", unsafe_allow_html=True)
                 alt_1 = st.text_input("A1", value="", key=f"a1_{roi_id}_{curr_uid}", label_visibility="collapsed")
