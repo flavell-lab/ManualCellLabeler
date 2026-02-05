@@ -22,13 +22,13 @@ if 'setup_complete' not in st.session_state:
 if 'current_index' not in st.session_state:
     st.session_state.current_index = 0
 if 'decision' not in st.session_state:
-    st.session_state.decision = "Not Sure"
+    st.session_state.decision = "No"
 
 def inject_ui_styling():
     st.markdown("""
         <style>
-        div[data-testid="stSegmentedControl"] button { height: 4rem !important; min-height: 4rem !important; }
-        div[data-testid="stSegmentedControl"] p { font-size: 22px !important; font-weight: bold !important; }
+        div[data-testid="stSegmentedControl"] button { height: 6rem !important; min-height: 6rem !important; }
+        div[data-testid="stSegmentedControl"] p { font-size: 28px !important; font-weight: bold !important; }
         .input-label { font-size: 22px !important; font-weight: bold !important; margin-bottom: -10px !important; margin-top: 15px !important; display: block; }
         .metadata-footer { color: #333; margin-top: 300px; font-size: 14px; border-top: 1px solid #222; padding-top: 10px; }
         </style>
@@ -126,6 +126,7 @@ def load_from_multi_project_csv(query, csv_path=None):
             roi_row = csv_df[csv_df['ROI ID'] == roi_id]
 
             if not roi_row.empty:
+                # ROI found in labels_csv - use existing metadata
                 roi_info = roi_row.iloc[0].to_dict()
                 roi_info['prj_name'] = prj
                 roi_info['data_uid'] = uid
@@ -133,6 +134,23 @@ def load_from_multi_project_csv(query, csv_path=None):
                 roi_info['csv_predicted_label'] = row['predicted_label']
                 roi_info['csv_tier'] = row['tier']
                 roi_info['csv_flags'] = row['flags']
+                valid_rows.append(roi_info)
+            else:
+                # ROI not found in labels_csv - create synthetic metadata
+                roi_info = {
+                    'ROI ID': roi_id,
+                    'Neuron Class': "",
+                    'Confidence': 1,
+                    'Coordinates': "",
+                    'Alternatives': "",
+                    'Notes': "ROI not in labels_csv - synthetic entry",
+                    'ChangeLog': "",
+                    'prj_name': prj,
+                    'data_uid': uid,
+                    'csv_predicted_label': row['predicted_label'],
+                    'csv_tier': row['tier'],
+                    'csv_flags': row['flags']
+                }
                 valid_rows.append(roi_info)
 
     return pd.DataFrame(valid_rows) if valid_rows else pd.DataFrame()
@@ -187,7 +205,7 @@ if not st.session_state.setup_complete:
         annotator = st.text_input("Enter flv-c username", value="candy")
         query = st.text_input("Neuron Class Query", value="NSM", help="Filter by neuron class (predicted_label in CSV mode)")
     with c2:
-        dest_path = st.text_input("⭐ Output Directory (Required)", value=f"/store1/{annotator}/", placeholder="Enter output directory path")
+        dest_path = st.text_input("⭐ Output Directory (Required)", value="/store1/shared/flv_utils_data/flagging/relabelled", placeholder="Enter output directory path")
 
     if not dest_path or not annotator:
         st.warning("⚠️ Please provide both username and output directory before proceeding.")
@@ -292,8 +310,7 @@ else:
             conf_val = 2
 
         if 'last_idx' not in st.session_state or st.session_state.last_idx != st.session_state.current_index:
-            if original_conf >= 4: st.session_state.decision = "Yes"
-            elif original_conf == 3: st.session_state.decision = "Not Sure"
+            if original_conf >= 3: st.session_state.decision = "Yes"
             else: st.session_state.decision = "No"
             st.session_state.last_idx = st.session_state.current_index
 
@@ -323,13 +340,17 @@ else:
                         axes[i].set_ylabel(labels[i], fontsize=12, fontweight='bold', color='white', rotation=0, labelpad=45, va='center')
                         axes[i].set_xticks([]); axes[i].set_yticks([]); axes[i].set_facecolor((0,0,0,0))
                     
-                    trace_idx = roi_match[roi_id-1]
                     num_traces = traces_array.shape[-1]
-                    if 0 < trace_idx <= num_traces:
-                        axes[3].plot(traces_array[..., trace_idx-1], color='lime', linewidth=1.5)
-                        for idx in np.where(reversal_vec == 1)[0]: axes[3].axvspan(idx, idx+1, color='pink', alpha=0.3)
+                    if roi_id - 1 < len(roi_match):
+                        trace_idx = roi_match[roi_id-1]
+                        if 0 < trace_idx <= num_traces:
+                            axes[3].plot(traces_array[..., trace_idx-1], color='lime', linewidth=1.5)
+                            for idx in np.where(reversal_vec == 1)[0]: axes[3].axvspan(idx, idx+1, color='pink', alpha=0.3)
+                        else:
+                            axes[3].text(0.5, 0.5, f"Trace unavailable (index {trace_idx}, max {num_traces})",
+                                         transform=axes[3].transAxes, ha='center', va='center', color='orange', fontsize=12)
                     else:
-                        axes[3].text(0.5, 0.5, f"Trace unavailable (index {trace_idx}, max {num_traces})",
+                        axes[3].text(0.5, 0.5, f"ROI {roi_id} out of match range (max {len(roi_match)})",
                                      transform=axes[3].transAxes, ha='center', va='center', color='orange', fontsize=12)
                     axes[3].set_ylabel(labels[3], fontsize=12, fontweight='bold', color='white', rotation=0, labelpad=45, va='center')
                     axes[3].tick_params(colors='white'); axes[3].set_facecolor((0,0,0,0))
@@ -338,7 +359,7 @@ else:
             with col_ctrl:
                 st.markdown(f"<h1 style='text-align: center; margin-bottom: 20px;'>Is this {query}?</h1>", unsafe_allow_html=True)
                 
-                selection = st.segmented_control("Decision", options=["Yes", "Not Sure", "No"], selection_mode="single", default=st.session_state.decision, key=f"d_{roi_id}_{curr_uid}")
+                selection = st.segmented_control("Decision", options=["Yes", "No"], selection_mode="single", default=st.session_state.decision, key=f"d_{roi_id}_{curr_uid}")
                 if selection: st.session_state.decision = selection
 
                 st.divider()
