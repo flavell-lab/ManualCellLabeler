@@ -68,25 +68,17 @@ def aggregate_matches(query, selected_configs):
     return pd.concat(all_matches).reset_index(drop=True) if all_matches else pd.DataFrame()
 
 def get_already_labeled_rois(dest_path, query, annotator):
-    """Get list of ROIs already labeled today"""
-    from datetime import datetime
-    today = datetime.now().strftime('%Y-%m-%d')
+    """Get set of ROIs already reviewed in the log file (any date)."""
     log_file = os.path.join(dest_path, f"{query}_{annotator}_log.csv")
 
     if not os.path.exists(log_file):
         return set()
 
     log_df = pd.read_csv(log_file)
-    # Filter for entries from today
-    if 'Timestamp' in log_df.columns:
-        log_df['Date'] = pd.to_datetime(log_df['Timestamp']).dt.strftime('%Y-%m-%d')
-        today_entries = log_df[log_df['Date'] == today]
-    else:
-        today_entries = log_df
 
     # Create a set of (Project, UID, ROI_ID) tuples for already-labeled ROIs
     already_labeled = set()
-    for _, row in today_entries.iterrows():
+    for _, row in log_df.iterrows():
         already_labeled.add((row['Project'], row['UID'], int(row['ROI_ID'])))
 
     return already_labeled
@@ -154,6 +146,48 @@ def load_from_multi_project_csv(query, csv_path=None):
                 valid_rows.append(roi_info)
 
     return pd.DataFrame(valid_rows) if valid_rows else pd.DataFrame()
+
+def filter_rois_with_traces(matches_df):
+    """Filter out ROIs that don't have valid freely moving traces.
+    Returns (filtered_df, num_skipped)."""
+    if matches_df.empty:
+        return matches_df, 0
+
+    valid_mask = []
+    trace_info_cache = {}
+
+    for _, row in matches_df.iterrows():
+        prj = row['prj_name']
+        uid = row['data_uid']
+        roi_id = int(row['ROI ID'])
+
+        cache_key = (prj, uid)
+        if cache_key not in trace_info_cache:
+            prj_root = os.path.join(FLV_UTILS_DATA_DIR, prj)
+            data_path = os.path.join(prj_root, f"processed_h5/{uid}-data.h5")
+            try:
+                with h5py.File(data_path, 'r') as f:
+                    roi_match = f['neuropal_registration/roi_match'][:]
+                    num_traces = f['gcamp/trace_array_original'].shape[-1]
+                trace_info_cache[cache_key] = (roi_match, num_traces)
+            except Exception:
+                trace_info_cache[cache_key] = None
+
+        info = trace_info_cache[cache_key]
+        if info is None:
+            valid_mask.append(False)
+            continue
+
+        roi_match, num_traces = info
+        if roi_id - 1 < len(roi_match):
+            trace_idx = roi_match[roi_id - 1]
+            valid_mask.append(0 < trace_idx <= num_traces)
+        else:
+            valid_mask.append(False)
+
+    filtered = matches_df[valid_mask].reset_index(drop=True)
+    skipped = len(matches_df) - len(filtered)
+    return filtered, skipped
 
 def load_roi_data(prj, uid):
     prj_root = os.path.join(FLV_UTILS_DATA_DIR, prj)
@@ -242,13 +276,19 @@ if not st.session_state.setup_complete:
                             )].reset_index(drop=True)
                             skipped_count = original_count - len(matches)
                             if skipped_count > 0:
-                                st.info(f"📋 Resuming from progress: Skipped {skipped_count} already-labeled ROIs from today")
+                                st.info(f"📋 Skipped {skipped_count} already-reviewed ROIs")
+
+                        if not matches.empty:
+                            # Filter out ROIs without valid traces
+                            matches, trace_skipped = filter_rois_with_traces(matches)
+                            if trace_skipped > 0:
+                                st.info(f"Skipped {trace_skipped} ROIs without freely moving traces")
 
                         if not matches.empty:
                             st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "setup_complete": True, "current_index": 0})
                             st.rerun()
                         else:
-                            st.success("🎉 All ROIs for this query have been labeled today!")
+                            st.success("🎉 All ROIs for this query have already been reviewed!")
                     else:
                         st.error(f"No matches found for query '{query}' in selected projects.")
 
@@ -276,14 +316,20 @@ if not st.session_state.setup_complete:
                     )].reset_index(drop=True)
                     skipped_count = original_count - len(matches)
                     if skipped_count > 0:
-                        st.info(f"📋 Resuming from progress: Skipped {skipped_count} already-labeled ROIs from today")
+                        st.info(f"📋 Skipped {skipped_count} already-reviewed ROIs")
+
+                if not matches.empty:
+                    # Filter out ROIs without valid traces
+                    matches, trace_skipped = filter_rois_with_traces(matches)
+                    if trace_skipped > 0:
+                        st.info(f"Skipped {trace_skipped} ROIs without freely moving traces")
 
                 if not matches.empty:
                     st.success(f"✅ Loaded {len(matches)} ROIs matching '{query}'")
                     st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "setup_complete": True, "current_index": 0})
                     st.rerun()
                 else:
-                    st.success("🎉 All ROIs for this query have been labeled today!")
+                    st.success("🎉 All ROIs for this query have already been reviewed!")
             else:
                 st.error(f"No valid ROIs found for query '{query}' in multi-project CSV.")
 

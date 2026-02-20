@@ -32,6 +32,5 @@ source .venv/bin/activate && streamlit run app.py
 
 **Integrate relabels to labels_csv**
 ```
-from update_labels_from_log import update_labels_csv                                                                               
-update_labels_csv("/store1/shared/flv_utils_data/flagging/relabelled/AVA_candy_log.csv", dry_run=False)    
+python update_labels_from_log.py /store1/shared/flv_utils_data/flagging/relabelled/BAG_candy_log.csv --apply 
 ```

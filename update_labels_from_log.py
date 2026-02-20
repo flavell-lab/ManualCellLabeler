@@ -153,10 +153,18 @@ def update_labels_csv(log_path, dry_run=True):
                 elif decision == 'No' and (new_label == '' or new_label in special_labels):
                     # Also create new rows for special labels
                     should_create = True
+                elif decision == 'No' and new_label and new_conf >= 3:
+                    # Also create new rows for confident neuron class relabels
+                    should_create = True
 
                 if should_create:
                     # Determine the label to use
-                    target_label = 'UNKNOWN' if new_label == '' else new_label
+                    if new_label == '' and decision == 'Yes':
+                        target_label = query  # Default to queried class for Yes decisions
+                    elif new_label == '':
+                        target_label = 'UNKNOWN'
+                    else:
+                        target_label = new_label
 
                     print(f"   ➕ ROI {roi_id} not found in labels_csv - creating new row")
                     # Create new row with minimal data
@@ -225,12 +233,12 @@ def update_labels_csv(log_path, dry_run=True):
                     updates_desc.append(f"Conf: {current_conf} → {new_conf}")
                     changes_made = True
 
-                # If label is empty or same as current, keep current label
-                # If label is different, update it
-                if new_label and new_label != current_label:
-                    labels_df.loc[mask, 'Neuron Class'] = new_label
-                    new_label_for_diff = new_label
-                    updates_desc.append(f"Label: {current_label} → {new_label}")
+                # If label is empty, default to the queried class
+                effective_label = new_label if new_label else query
+                if effective_label != current_label:
+                    labels_df.loc[mask, 'Neuron Class'] = effective_label
+                    new_label_for_diff = effective_label
+                    updates_desc.append(f"Label: {current_label} → {effective_label}")
                     changes_made = True
 
             elif decision == 'No':
