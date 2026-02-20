@@ -27,6 +27,7 @@ if 'decision' not in st.session_state:
 def inject_ui_styling():
     st.markdown("""
         <style>
+        .main .block-container { padding-left: 1rem !important; padding-right: 1rem !important; max-width: 100% !important; }
         div[data-testid="stSegmentedControl"] button { height: 6rem !important; min-height: 6rem !important; }
         div[data-testid="stSegmentedControl"] p { font-size: 28px !important; font-weight: bold !important; }
         .input-label { font-size: 22px !important; font-weight: bold !important; margin-bottom: -10px !important; margin-top: 15px !important; display: block; }
@@ -196,9 +197,10 @@ def load_roi_data(prj, uid):
         with h5py.File(os.path.join(prj_root, f"autolabel_data/{uid}-NeuroPAL.h5"), 'r') as f: raw = f['raw'][:]
         with h5py.File(os.path.join(prj_root, f"processed_h5/{uid}-data.h5"), 'r') as f:
             rev = f['behavior/reversal_vec'][:]
-            traces = f['gcamp/trace_array_original'][:]
+            traces_orig = f['gcamp/trace_array_original'][:]
+            traces_zscore = f['gcamp/trace_array'][:]
             match = f['neuropal_registration/roi_match'][:]
-        return rois, raw, rev, traces, match
+        return rois, raw, rev, traces_orig, traces_zscore, match
     except Exception as e:
         st.error(f"Failed to load {prj}/{uid}: {e}"); return None
 
@@ -210,7 +212,14 @@ def create_composite_mip(neuropal_data, roi_volume, target_roi_id):
     mip = np.max(neuropal_data, axis=1)
     r, g, b, s = [normalize(mip[i]) for i in range(4)]
     roi_mip = np.max((roi_volume == target_roi_id).astype(float), axis=0)
-    return np.stack([r, g, b], axis=-1), s, np.stack([roi_mip, roi_mip, np.zeros_like(roi_mip)], axis=-1)
+    return np.stack([r, g, b], axis=-1), s, np.stack([roi_mip, np.zeros_like(roi_mip), np.zeros_like(roi_mip)], axis=-1)
+
+def create_composite_mip_xz(neuropal_data, roi_volume, target_roi_id):
+    """MIP across Y axis to yield XZ plane."""
+    mip = np.max(neuropal_data, axis=2)  # (4, Z, X)
+    r, g, b, s = [normalize(mip[i]) for i in range(4)]
+    roi_mip = np.max((roi_volume == target_roi_id).astype(float), axis=1)  # (Z, X)
+    return np.stack([r, g, b], axis=-1), s, np.stack([roi_mip, np.zeros_like(roi_mip), np.zeros_like(roi_mip)], axis=-1)
 
 def draw_arrows(ax, fx, fy):
     for dx, dy, ox, oy in [(0, -GAP, 0, -TAIL_DIST), (0, GAP, 0, TAIL_DIST), (-GAP, 0, -TAIL_DIST, 0), (GAP, 0, TAIL_DIST, 0)]:
@@ -362,8 +371,8 @@ else:
 
         data = load_roi_data(curr_prj, curr_uid)
         if data:
-            h5_rois, h5_raw, reversal_vec, traces_array, roi_match = data
-            col_viz, col_ctrl = st.columns([6, 4], gap="large")
+            h5_rois, h5_raw, reversal_vec, traces_orig, traces_zscore, roi_match = data
+            col_viz, col_xz, col_ctrl = st.columns([4.25, 3.75, 2], gap="small")
 
             with col_viz:
                 coords = np.argwhere(h5_rois == roi_id)
@@ -376,36 +385,74 @@ else:
                     thin_ctx = (rgb_t * 0.7) + (np.stack([s_t]*3, -1) * 0.3)
                     thin_loc = np.where(y_t[..., 0:1] > 0, y_t, np.stack([s_t]*3, -1))
 
-                    fig, axes = plt.subplots(4, 1, figsize=(7, 14), gridspec_kw={'hspace': 0.15})
-                    fig.patch.set_alpha(0.0) 
+                    fig, axes = plt.subplots(4, 1, figsize=(7, 10), gridspec_kw={'hspace': 0.2, 'height_ratios': [2.8, 2.8, 2.8, 1.6]})
+                    fig.patch.set_alpha(0.0)
+                    fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.02)
                     imgs = [full_ctx, thin_ctx, thin_loc]
-                    labels = ["FULL MIP", f"Z-SLICES\n{z_s}-{z_e}", f"ROI {roi_id}", "TRACE"]
+                    labels = [f"MIP across Z (XY view)", f"Averaged across Z-slices {z_s}-{z_e}", f"ROI {roi_id} (XY view)", "Trace (Z-scored)"]
                     for i in range(3):
-                        axes[i].imshow(np.clip(imgs[i], 0, 1))
+                        axes[i].imshow(np.clip(imgs[i], 0, 1), aspect='auto')
                         if i < 2: draw_arrows(axes[i], x_c, y_c)
-                        axes[i].set_ylabel(labels[i], fontsize=12, fontweight='bold', color='white', rotation=0, labelpad=45, va='center')
+                        axes[i].text(0.01, 0.97, labels[i], transform=axes[i].transAxes, fontsize=10, color='white', va='top', ha='left')
                         axes[i].set_xticks([]); axes[i].set_yticks([]); axes[i].set_facecolor((0,0,0,0))
                     
-                    num_traces = traces_array.shape[-1]
+                    num_traces_z = traces_zscore.shape[-1]
                     if roi_id - 1 < len(roi_match):
                         trace_idx = roi_match[roi_id-1]
-                        if 0 < trace_idx <= num_traces:
-                            axes[3].plot(traces_array[..., trace_idx-1], color='lime', linewidth=1.5)
+                        if 0 < trace_idx <= num_traces_z:
+                            axes[3].plot(traces_zscore[..., trace_idx-1], color='lime', linewidth=1.5)
                             for idx in np.where(reversal_vec == 1)[0]: axes[3].axvspan(idx, idx+1, color='pink', alpha=0.3)
                         else:
-                            axes[3].text(0.5, 0.5, f"Trace unavailable (index {trace_idx}, max {num_traces})",
+                            axes[3].text(0.5, 0.5, f"Trace unavailable (index {trace_idx}, max {num_traces_z})",
                                          transform=axes[3].transAxes, ha='center', va='center', color='orange', fontsize=12)
                     else:
                         axes[3].text(0.5, 0.5, f"ROI {roi_id} out of match range (max {len(roi_match)})",
                                      transform=axes[3].transAxes, ha='center', va='center', color='orange', fontsize=12)
-                    axes[3].set_ylabel(labels[3], fontsize=12, fontweight='bold', color='white', rotation=0, labelpad=45, va='center')
+                    axes[3].set_title(labels[3], fontsize=10, color='white', loc='left', pad=4)
                     axes[3].tick_params(colors='white'); axes[3].set_facecolor((0,0,0,0))
                     st.pyplot(fig, use_container_width=True, clear_figure=True)
 
+            with col_xz:
+                if coords.size > 0:
+                    # XZ MIPs (projection across Y)
+                    rgb_xz, s_xz, _ = create_composite_mip_xz(h5_raw, h5_rois, roi_id)
+                    full_ctx_xz = (rgb_xz * 0.7) + (np.stack([s_xz]*3, -1) * 0.3)
+                    y_s, y_e = np.clip([y_c-4, y_c+4], 0, h5_raw.shape[2]-1)
+                    rgb_xz_t, s_xz_t, y_xz_t = create_composite_mip_xz(h5_raw[:, :, y_s:y_e], h5_rois[:, y_s:y_e], roi_id)
+                    thin_ctx_xz = (rgb_xz_t * 0.7) + (np.stack([s_xz_t]*3, -1) * 0.3)
+                    thin_loc_xz = np.where(y_xz_t[..., 0:1] > 0, y_xz_t, np.stack([s_xz_t]*3, -1))
+
+                    xz_fig_h = 10 * (4.3 / 3.7)  # scale height to compensate for narrower column
+                    fig_xz, axes_xz = plt.subplots(4, 1, figsize=(7, xz_fig_h), gridspec_kw={'hspace': 0.16, 'height_ratios': [2.8, 2.8, 2.8, 1.6]})
+                    fig_xz.patch.set_alpha(0.0)
+                    fig_xz.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.02)
+                    imgs_xz = [full_ctx_xz, thin_ctx_xz, thin_loc_xz]
+                    labels_xz = [f"MIP across Y (XZ view)", f"Averaged across Y-slices {y_s}-{y_e}", f"ROI {roi_id} (XZ view)", "Trace (original green/red)"]
+                    for i in range(3):
+                        axes_xz[i].imshow(np.clip(imgs_xz[i], 0, 1), aspect='auto')
+                        if i < 2: draw_arrows(axes_xz[i], x_c, z_c)
+                        axes_xz[i].text(0.01, 0.97, labels_xz[i], transform=axes_xz[i].transAxes, fontsize=10, color='white', va='top', ha='left')
+                        axes_xz[i].set_xticks([]); axes_xz[i].set_yticks([]); axes_xz[i].set_facecolor((0,0,0,0))
+
+                    num_traces_o = traces_orig.shape[-1]
+                    if roi_id - 1 < len(roi_match):
+                        trace_idx = roi_match[roi_id-1]
+                        if 0 < trace_idx <= num_traces_o:
+                            axes_xz[3].plot(traces_orig[..., trace_idx-1], color='lime', linewidth=1.5)
+                            for idx in np.where(reversal_vec == 1)[0]: axes_xz[3].axvspan(idx, idx+1, color='pink', alpha=0.3)
+                        else:
+                            axes_xz[3].text(0.5, 0.5, f"Trace unavailable", transform=axes_xz[3].transAxes, ha='center', va='center', color='orange', fontsize=12)
+                    else:
+                        axes_xz[3].text(0.5, 0.5, f"ROI out of range", transform=axes_xz[3].transAxes, ha='center', va='center', color='orange', fontsize=12)
+                    axes_xz[3].set_title(labels_xz[3], fontsize=10, color='white', loc='left', pad=4)
+                    axes_xz[3].tick_params(colors='white'); axes_xz[3].set_facecolor((0,0,0,0))
+                    st.pyplot(fig_xz, use_container_width=True, clear_figure=True)
+
             with col_ctrl:
                 st.markdown(f"<h1 style='text-align: center; margin-bottom: 20px;'>Is this {query}?</h1>", unsafe_allow_html=True)
-                
-                selection = st.segmented_control("Decision", options=["Yes", "No"], selection_mode="single", default=st.session_state.decision, key=f"d_{roi_id}_{curr_uid}")
+
+                st.markdown("<span class='input-label'>Decision</span>", unsafe_allow_html=True)
+                selection = st.segmented_control("Decision", options=["Yes", "No"], selection_mode="single", default=st.session_state.decision, key=f"d_{roi_id}_{curr_uid}", label_visibility="collapsed")
                 if selection: st.session_state.decision = selection
 
                 st.divider()
