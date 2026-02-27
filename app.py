@@ -11,8 +11,8 @@ from datetime import datetime
 st.set_page_config(layout="wide", page_title="ManualCellLabeler")
 
 # Constants
-FLV_UTILS_DATA_DIR = "/store1/shared/flv_utils_data/"
-MULTI_PROJECT_CSV = "/store1/shared/flv_utils_data/flagging/flagged_rois/all_projects_flagged_sorted.csv"
+DEFAULT_DATA_DIR = "/store1/shared/flv_utils_data/"
+DEFAULT_MULTI_PROJECT_CSV = "/store1/shared/flv_utils_data/flagging/flagged_rois/all_projects_flagged_sorted.csv"
 ARROW_STYLE = dict(facecolor='white', edgecolor='black', width=4, headwidth=12, shrink=0.05)
 GAP, LENGTH = 2, 8
 TAIL_DIST = GAP + LENGTH
@@ -40,8 +40,8 @@ def inject_ui_styling():
 
 # --- 2. UTILITIES ---
 
-def get_valid_uids(prj_name):
-    prj_root = os.path.join(FLV_UTILS_DATA_DIR, prj_name)
+def get_valid_uids(prj_name, data_dir):
+    prj_root = os.path.join(data_dir, prj_name)
     label_dir = os.path.join(prj_root, "labels_csv")
     if not os.path.exists(label_dir): return []
 
@@ -58,10 +58,10 @@ def get_valid_uids(prj_name):
     return valid_uids
 
 @st.cache_data
-def aggregate_matches(query, selected_configs):
+def aggregate_matches(query, selected_configs, data_dir):
     all_matches = []
     for prj, uid in selected_configs:
-        path_csv = os.path.join(FLV_UTILS_DATA_DIR, prj, f"labels_csv/{uid}.csv")
+        path_csv = os.path.join(data_dir, prj, f"labels_csv/{uid}.csv")
         df = pd.read_csv(path_csv)
         subset = df[df['Neuron Class'].str.startswith(query, na=False)].copy()
         subset = subset[pd.to_numeric(subset['ROI ID'], errors='coerce').notna()]
@@ -88,10 +88,10 @@ def get_already_labeled_rois(dest_path, query, annotator):
     return already_labeled
 
 @st.cache_data
-def load_from_multi_project_csv(query, csv_path=None):
+def load_from_multi_project_csv(query, data_dir, csv_path=None):
     """Load ROIs from multi-project CSV, filtered by predicted_label (neuron class)"""
     if csv_path is None:
-        csv_path = MULTI_PROJECT_CSV
+        csv_path = DEFAULT_MULTI_PROJECT_CSV
     df = pd.read_csv(csv_path)
 
     # Filter by predicted_label matching query
@@ -107,7 +107,7 @@ def load_from_multi_project_csv(query, csv_path=None):
         uid = row['target_id']
         roi_id = row['roi_id']
 
-        prj_root = os.path.join(FLV_UTILS_DATA_DIR, prj)
+        prj_root = os.path.join(data_dir, prj)
         paths = [
             os.path.join(prj_root, f"autolabel_data/{uid}-NeuroPAL.h5"),
             os.path.join(prj_root, f"neuron_rois/{uid}-roi.h5"),
@@ -151,7 +151,7 @@ def load_from_multi_project_csv(query, csv_path=None):
 
     return pd.DataFrame(valid_rows) if valid_rows else pd.DataFrame()
 
-def filter_rois_with_traces(matches_df):
+def filter_rois_with_traces(matches_df, data_dir):
     """Filter out ROIs that don't have valid freely moving traces.
     Returns (filtered_df, num_skipped)."""
     if matches_df.empty:
@@ -167,7 +167,7 @@ def filter_rois_with_traces(matches_df):
 
         cache_key = (prj, uid)
         if cache_key not in trace_info_cache:
-            prj_root = os.path.join(FLV_UTILS_DATA_DIR, prj)
+            prj_root = os.path.join(data_dir, prj)
             data_path = os.path.join(prj_root, f"processed_h5/{uid}-data.h5")
             try:
                 with h5py.File(data_path, 'r') as f:
@@ -194,8 +194,8 @@ def filter_rois_with_traces(matches_df):
     return filtered, skipped
 
 @st.cache_resource
-def load_roi_data(prj, uid):
-    prj_root = os.path.join(FLV_UTILS_DATA_DIR, prj)
+def load_roi_data(prj, uid, data_dir):
+    prj_root = os.path.join(data_dir, prj)
     try:
         with h5py.File(os.path.join(prj_root, f"neuron_rois/{uid}-roi.h5"), 'r') as f: rois = f['roi'][:]
         with h5py.File(os.path.join(prj_root, f"autolabel_data/{uid}-NeuroPAL.h5"), 'r') as f: raw = f['raw'][:]
@@ -338,28 +338,43 @@ if not st.session_state.setup_complete:
 
     st.divider()
 
+    data_dir = st.text_input("⭐ Data Directory (Required)", value=DEFAULT_DATA_DIR, help="Root directory containing project folders (prj_*) with h5 and labels_csv data")
+
     c1, c2 = st.columns(2)
     with c1:
         annotator = st.text_input("Enter flv-c username", value="candy")
         query = st.text_input("Neuron Class Query", value="NSM", help="Filter by neuron class (predicted_label in CSV mode)")
     with c2:
         dest_path = st.text_input("⭐ Output Directory (Required)", value="/store1/shared/flv_utils_data/flagging/relabelled", placeholder="Enter output directory path")
+        conf_lo, conf_hi = st.columns(2)
+        with conf_lo:
+            conf_lower = st.selectbox("Min Confidence", options=[1, 2, 3, 4, 5], index=2, help="Lower bound (inclusive) for original confidence score")
+        with conf_hi:
+            conf_upper = st.selectbox("Max Confidence", options=[1, 2, 3, 4, 5], index=4, help="Upper bound (inclusive) for original confidence score")
 
-    if not dest_path or not annotator:
-        st.warning("⚠️ Please provide both username and output directory before proceeding.")
+    if not data_dir or not dest_path or not annotator:
+        st.warning("⚠️ Please provide username, data directory, and output directory before proceeding.")
+        st.stop()
+
+    if not os.path.isdir(data_dir):
+        st.warning(f"⚠️ Data directory does not exist: {data_dir}")
+        st.stop()
+
+    if conf_lower > conf_upper:
+        st.warning("⚠️ Min Confidence cannot exceed Max Confidence.")
         st.stop()
 
     matches = None
     can_launch = False
 
     if mode == "Manual Project Selection":
-        all_projects = sorted([d for d in os.listdir(FLV_UTILS_DATA_DIR) if os.path.isdir(os.path.join(FLV_UTILS_DATA_DIR, d)) and d.startswith("prj_")])
+        all_projects = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d.startswith("prj_")])
         selected_projects = st.multiselect("Select Projects", options=all_projects)
 
         if selected_projects:
             final_configs = []
             for prj in selected_projects:
-                valid_uids = get_valid_uids(prj)
+                valid_uids = get_valid_uids(prj, data_dir)
                 if valid_uids:
                     chosen_uids = st.multiselect(f"UIDs for {prj}", options=valid_uids, default=valid_uids)
                     for uid in chosen_uids: final_configs.append((prj, uid))
@@ -367,7 +382,11 @@ if not st.session_state.setup_complete:
             if final_configs:
                 can_launch = True
                 if st.button("🚀 LAUNCH", type="primary", use_container_width=True):
-                    matches = aggregate_matches(query, final_configs)
+                    matches = aggregate_matches(query, final_configs, data_dir)
+                    if not matches.empty:
+                        # Filter by confidence range
+                        matches['_conf'] = pd.to_numeric(matches['Confidence'], errors='coerce').fillna(1).astype(int)
+                        matches = matches[(matches['_conf'] >= conf_lower) & (matches['_conf'] <= conf_upper)].drop(columns=['_conf']).reset_index(drop=True)
                     if not matches.empty:
                         # Filter out already-labeled ROIs from today
                         already_labeled = get_already_labeled_rois(dest_path, query, annotator)
@@ -384,12 +403,12 @@ if not st.session_state.setup_complete:
 
                         if not matches.empty:
                             # Filter out ROIs without valid traces
-                            matches, trace_skipped = filter_rois_with_traces(matches)
+                            matches, trace_skipped = filter_rois_with_traces(matches, data_dir)
                             if trace_skipped > 0:
                                 st.info(f"Skipped {trace_skipped} ROIs without freely moving traces")
 
                         if not matches.empty:
-                            st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "setup_complete": True, "current_index": 0})
+                            st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "data_dir": data_dir, "setup_complete": True, "current_index": 0})
                             st.rerun()
                         else:
                             st.success("🎉 All ROIs for this query have already been reviewed!")
@@ -399,15 +418,19 @@ if not st.session_state.setup_complete:
     else:  # Load from Multi-Project CSV
         csv_path = st.text_input(
             "Multi-Project CSV Path",
-            value=MULTI_PROJECT_CSV,
+            value=DEFAULT_MULTI_PROJECT_CSV,
             help="Path to the flagged ROIs CSV file"
         )
         st.caption("ROIs will be processed in the order specified in the CSV file.")
 
         if st.button("🚀 LAUNCH", type="primary", use_container_width=True):
             with st.spinner("Loading ROIs from multi-project CSV..."):
-                matches = load_from_multi_project_csv(query, csv_path)
+                matches = load_from_multi_project_csv(query, data_dir, csv_path)
 
+            if not matches.empty:
+                # Filter by confidence range
+                matches['_conf'] = pd.to_numeric(matches['Confidence'], errors='coerce').fillna(1).astype(int)
+                matches = matches[(matches['_conf'] >= conf_lower) & (matches['_conf'] <= conf_upper)].drop(columns=['_conf']).reset_index(drop=True)
             if not matches.empty:
                 # Filter out already-labeled ROIs from today
                 already_labeled = get_already_labeled_rois(dest_path, query, annotator)
@@ -424,13 +447,13 @@ if not st.session_state.setup_complete:
 
                 if not matches.empty:
                     # Filter out ROIs without valid traces
-                    matches, trace_skipped = filter_rois_with_traces(matches)
+                    matches, trace_skipped = filter_rois_with_traces(matches, data_dir)
                     if trace_skipped > 0:
                         st.info(f"Skipped {trace_skipped} ROIs without freely moving traces")
 
                 if not matches.empty:
                     st.success(f"✅ Loaded {len(matches)} ROIs matching '{query}'")
-                    st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "setup_complete": True, "current_index": 0})
+                    st.session_state.update({"matches": matches, "query": query, "annotator": annotator, "dest_path": dest_path, "data_dir": data_dir, "setup_complete": True, "current_index": 0})
                     st.rerun()
                 else:
                     st.success("🎉 All ROIs for this query have already been reviewed!")
@@ -440,7 +463,7 @@ if not st.session_state.setup_complete:
 # --- 4. PHASE 2: ANNOTATION ---
 else:
     inject_ui_styling()
-    matches, query, annotator, dest_path = st.session_state.matches, st.session_state.query, st.session_state.annotator, st.session_state.dest_path
+    matches, query, annotator, dest_path, data_dir = st.session_state.matches, st.session_state.query, st.session_state.annotator, st.session_state.dest_path, st.session_state.data_dir
 
     if st.session_state.current_index < len(matches):
         row = matches.iloc[st.session_state.current_index]
@@ -464,7 +487,7 @@ else:
             else: st.session_state.decision = "No"
             st.session_state.last_idx = st.session_state.current_index
 
-        data = load_roi_data(curr_prj, curr_uid)
+        data = load_roi_data(curr_prj, curr_uid, data_dir)
         if data is None:
             st.error(f"Failed to load {curr_prj}/{curr_uid}")
         if data:
@@ -557,7 +580,7 @@ else:
                 next_prj, next_uid = next_row['prj_name'], next_row['data_uid']
                 next_cache_key = (next_prj, next_uid, next_roi_id)
                 if next_cache_key not in st.session_state.figure_cache:
-                    next_data = load_roi_data(next_prj, next_uid)
+                    next_data = load_roi_data(next_prj, next_uid, data_dir)
                     if next_data:
                         n_rois, n_raw, n_rev, n_traces_orig, n_traces_zscore, n_match = next_data
                         next_xy, next_xz = render_roi_figures(n_rois, n_raw, n_rev, n_traces_orig, n_traces_zscore, n_match, next_roi_id)
