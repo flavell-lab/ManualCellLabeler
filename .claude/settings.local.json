@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source .venv/bin/activate)",
+      "Bash(streamlit run:*)",
+      "Bash(python:*)",
+      "Bash(pkill:*)",
+      "Bash(curl:*)",
+      "Bash(for log in AVA I3 RIV AQR BAG RMG)",
+      "Bash(do)",
+      "Bash(echo:*)",
+      "Bash(done)",
+      "Bash(wc:*)",
+      "Bash(ls:*)"
+    ]
+  }
+}
