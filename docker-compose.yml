@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount the shared data directory (read-only)
+      - /store1/shared/flv_utils_data:/store1/shared/flv_utils_data:ro
+      # Mount an output directory for labeling logs (read-write)
+      - /store1/shared/flv_utils_data/flagging/relabelled:/store1/shared/flv_utils_data/flagging/relabelled
