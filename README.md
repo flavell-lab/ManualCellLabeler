@@ -3,13 +3,7 @@
 Interactive Streamlit app for manual neuron label confirmation using NeuroPAL and related HDF5/CSV data.
 
 **Usage**
-- **Activate project virtualenv** (from project root):
-
-```bash
-source .venv/bin/activate
-```
-
-- **Run the Streamlit app**:
+- **Run the Streamlit app locally**:
 
 ```bash
 source .venv/bin/activate && streamlit run app.py
@@ -26,40 +20,31 @@ source .venv/bin/activate && streamlit run app.py
 - Dependencies are listed in `pyproject.toml`.
 
 
-**Podman (containerized deployment)**
+**Containerized deployment**
 
-This project uses podman. Because the NFS-backed home directory does not support extended attributes, podman storage must be pointed to a local filesystem (e.g. `/tmp`).
-
-Build:
+Use `run.sh` to build (if needed) and launch the container:
 
 ```bash
-# Set up local storage (required on NFS-backed machines; cleared on reboot)
-export PODMAN_ROOT=/tmp/candy-podman-storage/root
-export PODMAN_RUNROOT=/tmp/candy-podman-storage/runroot
-
-podman --root $PODMAN_ROOT --runroot $PODMAN_RUNROOT build -t manual-cell-labeler .
+./run.sh /store1/path/to/your/data_dir
 ```
 
-Run:
+Optional second argument for a custom output directory (defaults to `<data_dir>/relabelled`):
 
 ```bash
-podman --root $PODMAN_ROOT --runroot $PODMAN_RUNROOT run -p 8501:8501 \
-  -v /store1/shared/flv_utils_data:/store1/shared/flv_utils_data:ro \
-  -v /store1/shared/flv_utils_data/flagging/relabelled:/store1/shared/flv_utils_data/flagging/relabelled \
-  manual-cell-labeler
+./run.sh /store1/path/to/your/data_dir /store1/path/to/output_dir
 ```
 
-Then open http://localhost:8501 (Firefox recommended).
-
-Customize the `-v` mounts for your data and output directories. The cold build takes ~35s after a reboot (no cached layers).
-
-Clean up storage:
+A free port is auto-selected from 3001-3030, so multiple users can run simultaneously. In case you would like to force a specific port (e.g. `3005`):
 
 ```bash
-podman --root $PODMAN_ROOT --runroot $PODMAN_RUNROOT system reset --force
+PORT=3005 ./run.sh /store1/path/to/your/data_dir
 ```
 
-**Integrate relabels to labels_csv**
+The assigned port is printed on startup (Firefox recommended).
+
+The image is built automatically on first run or after a reboot (~35s cold build). Podman storage is kept under `/tmp/<user>-podman-storage/` to work around NFS xattr limitations.
+
+**Integrate relabels to labels_csv on CLI**
 ```
-uv run python update_labels_from_log.py /store1/shared/flv_utils_data/flagging/relabelled/AVA_candy_log.csv --apply 
+uv run python update_labels_from_log.py /store1/path/to/output_dir/$(neuron_class)_$(user)_log.csv --apply 
 ```

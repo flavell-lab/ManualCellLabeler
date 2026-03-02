@@ -11,8 +11,7 @@
       "Bash(echo:*)",
       "Bash(done)",
       "Bash(wc:*)",
-      "Bash(ls:*)",
-      "Bash(podman build:*)"
+      "Bash(ls:*)"
     ]
   }
 }
